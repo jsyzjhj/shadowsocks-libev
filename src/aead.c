@@ -177,9 +177,13 @@ aead_cipher_encrypt(cipher_ctx_t *cipher_ctx,
     // Otherwise, just use the mbedTLS one with crappy AES-NI.
     case AES192GCM:
     case AES128GCM:
-
+#if MBEDTLS_VERSION_NUMBER < 0x03000000
         err = mbedtls_cipher_auth_encrypt(cipher_ctx->evp, n, nlen, ad, adlen,
                                           m, mlen, c, clen, c + mlen, tlen);
+#else
+        err = mbedtls_cipher_auth_encrypt_ext(cipher_ctx->evp, n, nlen, ad, adlen,
+                                              m, mlen, c, mlen + tlen, clen, tlen);
+#endif
         *clen += tlen;
         break;
     case CHACHA20POLY1305IETF:
@@ -226,8 +230,13 @@ aead_cipher_decrypt(cipher_ctx_t *cipher_ctx,
     // Otherwise, just use the mbedTLS one with crappy AES-NI.
     case AES192GCM:
     case AES128GCM:
+#if MBEDTLS_VERSION_NUMBER < 0x03000000
         err = mbedtls_cipher_auth_decrypt(cipher_ctx->evp, n, nlen, ad, adlen,
                                           m, mlen - tlen, p, plen, m + mlen - tlen, tlen);
+#else
+        err = mbedtls_cipher_auth_decrypt_ext(cipher_ctx->evp, n, nlen, ad, adlen,
+                                              m, mlen, p, mlen - tlen, plen, tlen);
+#endif
         break;
     case CHACHA20POLY1305IETF:
         err = crypto_aead_chacha20poly1305_ietf_decrypt(p, &long_plen, NULL, m, mlen,
@@ -617,9 +626,6 @@ aead_chunk_decrypt(cipher_ctx_t *ctx, uint8_t *p, uint8_t *c, uint8_t *n,
 
     sodium_increment(n, nlen);
 
-    if (*clen > chunk_len)
-        memmove(c, c + chunk_len, *clen - chunk_len);
-
     *clen = *clen - chunk_len;
 
     return CRYPTO_OK;
@@ -656,12 +662,12 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
 
         memcpy(cipher_ctx->salt, cipher_ctx->chunk->data, salt_len);
 
-        aead_cipher_ctx_set_key(cipher_ctx, 0);
-
         if (ppbloom_check((void *)cipher_ctx->salt, salt_len) == 1) {
             LOGE("crypto: AEAD: repeat salt detected");
             return CRYPTO_ERROR;
         }
+
+        aead_cipher_ctx_set_key(cipher_ctx, 0);
 
         memmove(cipher_ctx->chunk->data, cipher_ctx->chunk->data + salt_len,
                 cipher_ctx->chunk->len - salt_len);
@@ -671,22 +677,27 @@ aead_decrypt(buffer_t *ciphertext, cipher_ctx_t *cipher_ctx, size_t capacity)
     }
 
     size_t plen = 0;
+    size_t cidx = 0;
     while (cipher_ctx->chunk->len > 0) {
         size_t chunk_clen = cipher_ctx->chunk->len;
         size_t chunk_plen = 0;
         err = aead_chunk_decrypt(cipher_ctx,
                                  (uint8_t *)plaintext->data + plen,
-                                 (uint8_t *)cipher_ctx->chunk->data,
+                                 (uint8_t *)cipher_ctx->chunk->data + cidx,
                                  cipher_ctx->nonce, &chunk_plen, &chunk_clen);
         if (err == CRYPTO_ERROR) {
             return err;
         } else if (err == CRYPTO_NEED_MORE) {
             if (plen == 0)
                 return err;
-            else
+            else{
+                memmove((uint8_t *)cipher_ctx->chunk->data, 
+			(uint8_t *)cipher_ctx->chunk->data + cidx, chunk_clen);
                 break;
+            }
         }
         cipher_ctx->chunk->len = chunk_clen;
+        cidx += cipher_ctx->cipher->tag_len * 2 + CHUNK_SIZE_LEN + chunk_plen;
         plen                  += chunk_plen;
     }
     plaintext->len = plen;
@@ -719,17 +730,7 @@ aead_key_init(int method, const char *pass, const char *key)
     cipher_t *cipher = (cipher_t *)ss_malloc(sizeof(cipher_t));
     memset(cipher, 0, sizeof(cipher_t));
 
-    if (method >= CHACHA20POLY1305IETF) {
-        cipher_kt_t *cipher_info = (cipher_kt_t *)ss_malloc(sizeof(cipher_kt_t));
-        cipher->info             = cipher_info;
-        cipher->info->base       = NULL;
-        cipher->info->key_bitlen = supported_aead_ciphers_key_size[method] * 8;
-        cipher->info->iv_size    = supported_aead_ciphers_nonce_size[method];
-    } else {
-        cipher->info = (cipher_kt_t *)aead_get_cipher_type(method);
-    }
-
-    if (cipher->info == NULL && cipher->key_len == 0) {
+    if (method < CHACHA20POLY1305IETF && aead_get_cipher_type(method) == NULL) {
         LOGE("Cipher %s not found in crypto library", supported_aead_ciphers[method]);
         FATAL("Cannot initialize cipher");
     }
